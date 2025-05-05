@@ -1,0 +1,140 @@
+import re
+from src.utils.lm_modeling import load_model, load_text2embedding
+import torch
+from torch_geometric.data.data import Data
+import pandas as pd
+import os
+import torch.nn.functional as F
+import numpy as np
+from sentence_transformers import SentenceTransformer,util
+from src.dataset import load_dataset
+from torch.utils.data import DataLoader
+import json
+import pickle
+
+path = '../HOTPOPQA'
+
+nodeslist = []
+edgeslist = []
+deslist = []
+
+def textualize_graph(i,line):
+    triples = re.findall(r'\((.*?)\)', line)
+    nodes = {}
+    edges = []
+    des = {}
+    for tri in triples:
+        tri = tri.split(';')
+        # remove error triples
+        if len(tri) != 3:
+            if len(tri) >= 3:
+                tri[2] = ''.join(tri[2:len(tri)])
+            if len(tri) < 3:
+                continue
+
+        src, edge_attr, dst = tri[0].strip(),tri[1].strip(),tri[2].strip()
+        if src not in nodes:
+            nodes[src] = len(nodes)
+        if dst not in nodes:
+            nodes[dst] = len(nodes)
+        edges.append({'src': nodes[src], 'edge_attr': edge_attr.strip(), 'dst': nodes[dst], })
+        des[str(nodes[src])+','+ str(nodes[dst])] = '(' + src +',' + edge_attr + ',' + dst + ')'
+
+    nodes = pd.DataFrame(nodes.items(), columns=['node_attr', 'node_id'])
+    edges = pd.DataFrame(edges)
+    return nodes,edges,des
+
+def step_one():
+    # generate knowledge graphs and des
+    os.makedirs(f'{path}/KG_QA_vRobert/des500_new', exist_ok=True)
+    cnt = 1
+    tmp_nodeslist = []
+    tmp_edgeslist = []
+    tmp_deslist = []
+    with open(f'{path}/outputs(500).txt', 'r') as file:
+        for index, line in enumerate(file):
+                if line != '------------------------------------------\n':
+                    nodes, edges,des = textualize_graph(index,line)
+                    tmp_nodeslist.append(nodes)
+                    tmp_edgeslist.append(edges)
+                    tmp_deslist.append(des)
+                else:
+                    nodeslist.append(tmp_nodeslist)
+                    edgeslist.append(tmp_edgeslist)
+                    with open(f'{path}/KG_QA_vRobert/des500_new/{cnt}.pkl', 'wb') as file:
+                        pickle.dump(tmp_deslist, file)
+                    cnt += 1
+                    tmp_nodeslist = []
+                    tmp_edgeslist = []
+                    tmp_deslist = []
+
+def step_two():
+    # encode KGs
+    model = SentenceTransformer('../../../all-roberta-large-v1',device='cuda:1')
+
+    os.makedirs(f'{path}/KG_QA_vRobert', exist_ok=True)
+    os.makedirs(f'{path}/KG_QA_vRobert/graph500_new', exist_ok=True)
+
+    for i in range(len(nodeslist)):
+        os.makedirs(f'{path}/KG_QA_vRobert/graph500_new/{i}', exist_ok=True)
+        for j in range(len(nodeslist[i])):
+            nodes = nodeslist[i][j]
+            edges = edgeslist[i][j]
+            if not len(nodes) or not len(edges):
+                continue
+
+            node_des = nodes.node_attr.tolist()
+            edge_des = edges.edge_attr.tolist()
+
+            x = model.encode(node_des,convert_to_tensor = True)
+            e = model.encode(edge_des,convert_to_tensor = True)
+            edge_index = torch.LongTensor([edges.src, edges.dst])
+
+            data = Data(x=x, edge_index=edge_index, edge_attr=e, num_nodes=len(nodes))
+
+            torch.save(data, f'{path}/KG_QA_vRobert/graph500_new/{i}/{j}.pt')
+
+def encode_question():
+    model = SentenceTransformer('../../../all-roberta-large-v1')
+    os.makedirs(f'{path}/questions_emb_vRobert', exist_ok=True)
+
+    data_path = '../HOTPOPQA/hotpot_dev_fullwiki_v1.json'
+    with open(data_path, 'r') as file:
+        data = json.load(file)
+
+    for i in range(len(data)):
+        question = data[i]["question"]
+        question_emb = model.encode(question, convert_to_tensor=True)
+        torch.save(question_emb, f'{path}/questions_emb_vRobert/{i}.pt')
+
+def encode_doc():
+    model = SentenceTransformer('../../../all-roberta-large-v1',device='cuda:1')
+
+    os.makedirs(f'{path}/KG_QA_vRobert', exist_ok=True)
+    os.makedirs(f'{path}/KG_QA_vRobert/doc_text', exist_ok=True)
+    os.makedirs(f'{path}/KG_QA_vRobert/doc_emb', exist_ok=True)
+
+    data_path = '../HOTPOPQA/hotpot_dev_fullwiki_v1.json'
+    with open(data_path, 'r') as file:
+        data = json.load(file)
+
+    doc_text_list = []
+    doc_emb_list = []
+
+    for i in range(500):
+        docs = data[i]["context"]
+        for doc in docs:
+            passage = ''.join(doc[1][j] for j in range(len(doc[1])))
+            doc_emb = model.encode(passage, convert_to_tensor=True)
+            doc_emb_list.append(doc_emb)
+            doc_text_list.append(passage)
+
+    torch.save(torch.stack(doc_emb_list), f'{path}/KG_QA_vRobert/doc_emb/{500}.pt')
+    with open(f'{path}/KG_QA_vRobert/doc_text/{500}.pkl', 'wb') as file:
+        pickle.dump(doc_text_list, file)
+
+if __name__ == '__main__':
+    step_one()
+    step_two()
+    encode_question()
+    encode_doc()
